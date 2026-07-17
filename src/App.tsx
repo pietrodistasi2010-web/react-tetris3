@@ -45,6 +45,62 @@ type Piece = {
   col: number;
 };
 
+// ==================== AUDIO ====================
+let audioCtx: AudioContext | null = null;
+function getAudioCtx() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+  }
+  return audioCtx;
+}
+
+function playSound(type: 'move' | 'rotate' | 'lock' | 'clear' | 'levelup' | 'gameover' | 'drop') {
+  try {
+    const ctx = getAudioCtx();
+    if (ctx.state === 'suspended') ctx.resume();
+    
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    let freq = 440;
+    let duration = 0.08;
+    let volume = 0.1;
+    let waveform: OscillatorType = 'square';
+
+    switch (type) {
+      case 'move': freq = 220; duration = 0.03; volume = 0.05; break;
+      case 'rotate': freq = 330; duration = 0.04; volume = 0.06; break;
+      case 'lock': freq = 150; duration = 0.08; volume = 0.08; waveform = 'triangle'; break;
+      case 'drop': freq = 100; duration = 0.1; volume = 0.1; waveform = 'sawtooth'; break;
+      case 'clear': freq = 660; duration = 0.15; volume = 0.12; waveform = 'sine'; break;
+      case 'levelup': freq = 880; duration = 0.3; volume = 0.15; waveform = 'sine'; break;
+      case 'gameover': freq = 110; duration = 0.5; volume = 0.15; waveform = 'sawtooth'; break;
+    }
+
+    osc.type = waveform;
+    osc.frequency.setValueAtTime(freq, now);
+    
+    if (type === 'clear') {
+      osc.frequency.linearRampToValueAtTime(freq * 1.5, now + duration);
+    } else if (type === 'levelup') {
+      osc.frequency.linearRampToValueAtTime(freq * 1.2, now + duration);
+    } else if (type === 'gameover') {
+      osc.frequency.linearRampToValueAtTime(freq * 0.5, now + duration);
+    }
+
+    gain.gain.setValueAtTime(volume, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
+
+    osc.start(now);
+    osc.stop(now + duration);
+  } catch (e) {
+    // Audio non supportato o bloccato
+  }
+}
+
 // ==================== LOGICA GIOCO ====================
 function emptyBoard(): (string | null)[][] {
   const b: (string | null)[][] = [];
@@ -264,6 +320,7 @@ export default function App() {
     if (collides(boardRef.current, currentRef.current, 0, 0)) {
       gameOverRef.current = true;
       runningRef.current = false;
+      playSound('gameover');
       setOverlay({ title: 'Game Over', text: `Punteggio finale: ${scoreRef.current}`, btn: 'Riprova', show: true });
     }
   }, [takeFromBag]);
@@ -290,16 +347,20 @@ export default function App() {
     const { board: newBoard, cleared } = clearLines(boardRef.current);
     boardRef.current = newBoard;
     if (cleared > 0) {
+      playSound('clear');
       linesRef.current += cleared;
       scoreRef.current += LINE_SCORE[cleared] * levelRef.current;
       setScore(scoreRef.current);
       setLines(linesRef.current);
       const newLevel = Math.floor(linesRef.current / LINES_PER_LEVEL) + 1;
       if (newLevel !== levelRef.current) {
+        playSound('levelup');
         levelRef.current = newLevel;
         setLevel(newLevel);
         dropMsRef.current = Math.max(MIN_SPEED, BASE_SPEED - (newLevel - 1) * SPEED_STEP);
       }
+    } else {
+      playSound('lock');
     }
     spawn();
   }, [spawn]);
@@ -313,6 +374,7 @@ export default function App() {
     }
     scoreRef.current += dist * 2;
     setScore(scoreRef.current);
+    playSound('drop');
     lockAndSpawn();
   }, [lockAndSpawn]);
 
@@ -328,17 +390,25 @@ export default function App() {
 
   const moveLeft = useCallback(() => {
     if (!runningRef.current || pausedRef.current || !currentRef.current) return;
-    if (!collides(boardRef.current, currentRef.current, 0, -1)) currentRef.current.col--;
+    if (!collides(boardRef.current, currentRef.current, 0, -1)) {
+      currentRef.current.col--;
+      playSound('move');
+    }
   }, []);
 
   const moveRight = useCallback(() => {
     if (!runningRef.current || pausedRef.current || !currentRef.current) return;
-    if (!collides(boardRef.current, currentRef.current, 0, 1)) currentRef.current.col++;
+    if (!collides(boardRef.current, currentRef.current, 0, 1)) {
+      currentRef.current.col++;
+      playSound('move');
+    }
   }, []);
 
   const doRotate = useCallback(() => {
     if (!runningRef.current || pausedRef.current || !currentRef.current) return;
-    tryRotate(boardRef.current, currentRef.current);
+    if (tryRotate(boardRef.current, currentRef.current)) {
+      playSound('rotate');
+    }
   }, []);
 
   const togglePause = useCallback(() => {
