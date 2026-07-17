@@ -1,546 +1,215 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useTetris } from "@/hooks/useTetris";
+import { TetrisCanvas } from "@/components/TetrisCanvas";
+import { TouchControls } from "@/components/TouchControls";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Play, Pause, RotateCw } from "lucide-react";
 
-// ==================== COSTANTI ====================
-const COLS = 10;
-const ROWS = 20;
-const BUFFER = 2;
-const TOTAL_ROWS = ROWS + BUFFER;
-const CELL = 30;
-const W = COLS * CELL;
-const H = ROWS * CELL;
-const NEXT_CELL = 22;
-const NEXT_W = 4 * NEXT_CELL;
-const NEXT_H = 4 * NEXT_CELL;
-
-const COLORS: Record<string, [number, number]> = {
-  I: [188, 80], O: [50, 85], T: [280, 65],
-  S: [140, 60], Z: [0, 72], J: [222, 70], L: [28, 88]
-};
-
-const SHAPES: Record<string, number[][]> = {
-  I: [[0,0,0,0],[1,1,1,1],[0,0,0,0],[0,0,0,0]],
-  O: [[0,1,1,0],[0,1,1,0],[0,0,0,0],[0,0,0,0]],
-  T: [[0,1,0,0],[1,1,1,0],[0,0,0,0],[0,0,0,0]],
-  S: [[0,1,1,0],[1,1,0,0],[0,0,0,0],[0,0,0,0]],
-  Z: [[1,1,0,0],[0,1,1,0],[0,0,0,0],[0,0,0,0]],
-  J: [[1,0,0,0],[1,1,1,0],[0,0,0,0],[0,0,0,0]],
-  L: [[0,0,1,0],[1,1,1,0],[0,0,0,0],[0,0,0,0]]
-};
-const TYPES = ['I','O','T','S','Z','J','L'];
-
-const KICKS = [[0,0],[-1,0],[1,0],[0,-1],[-2,0],[2,0]];
-
-const LINE_SCORE = [0, 100, 300, 500, 800];
-const LINES_PER_LEVEL = 10;
-const BASE_SPEED = 800;
-const SPEED_STEP = 70;
-const MIN_SPEED = 80;
-const SOFT_DROP_FACTOR = 0.12;
-
-// ==================== TIPI ====================
-type Piece = {
-  type: string;
-  matrix: number[][];
-  row: number;
-  col: number;
-};
-
-// ==================== AUDIO ====================
-let audioCtx: AudioContext | null = null;
-function getAudioCtx() {
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-  }
-  return audioCtx;
-}
-
-function playSound(type: 'move' | 'rotate' | 'lock' | 'clear' | 'levelup' | 'gameover' | 'drop') {
-  try {
-    const ctx = getAudioCtx();
-    if (ctx.state === 'suspended') ctx.resume();
-    
-    const now = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-
-    let freq = 440;
-    let duration = 0.08;
-    let volume = 0.1;
-    let waveform: OscillatorType = 'square';
-
-    switch (type) {
-      case 'move': freq = 220; duration = 0.03; volume = 0.05; break;
-      case 'rotate': freq = 330; duration = 0.04; volume = 0.06; break;
-      case 'lock': freq = 150; duration = 0.08; volume = 0.08; waveform = 'triangle'; break;
-      case 'drop': freq = 100; duration = 0.1; volume = 0.1; waveform = 'sawtooth'; break;
-      case 'clear': freq = 660; duration = 0.15; volume = 0.12; waveform = 'sine'; break;
-      case 'levelup': freq = 880; duration = 0.3; volume = 0.15; waveform = 'sine'; break;
-      case 'gameover': freq = 110; duration = 0.5; volume = 0.15; waveform = 'sawtooth'; break;
-    }
-
-    osc.type = waveform;
-    osc.frequency.setValueAtTime(freq, now);
-    
-    if (type === 'clear') {
-      osc.frequency.linearRampToValueAtTime(freq * 1.5, now + duration);
-    } else if (type === 'levelup') {
-      osc.frequency.linearRampToValueAtTime(freq * 1.2, now + duration);
-    } else if (type === 'gameover') {
-      osc.frequency.linearRampToValueAtTime(freq * 0.5, now + duration);
-    }
-
-    gain.gain.setValueAtTime(volume, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
-
-    osc.start(now);
-    osc.stop(now + duration);
-  } catch (e) {
-    // Audio non supportato o bloccato
-  }
-}
-
-// ==================== LOGICA GIOCO ====================
-function emptyBoard(): (string | null)[][] {
-  const b: (string | null)[][] = [];
-  for (let r = 0; r < TOTAL_ROWS; r++) {
-    b.push(new Array(COLS).fill(null));
-  }
-  return b;
-}
-
-function refillBag(): string[] {
-  const bag = TYPES.slice();
-  for (let i = bag.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const tmp = bag[i]; bag[i] = bag[j]; bag[j] = tmp;
-  }
-  return bag;
-}
-
-function makePiece(type: string): Piece {
-  return {
-    type,
-    matrix: SHAPES[type].map(r => r.slice()),
-    row: 0,
-    col: 3
-  };
-}
-
-function collides(board: (string | null)[][], piece: Piece, dRow: number, dCol: number, matrix?: number[][]): boolean {
-  const m = matrix || piece.matrix;
-  for (let r = 0; r < m.length; r++) {
-    for (let c = 0; c < m[r].length; c++) {
-      if (!m[r][c]) continue;
-      const nr = piece.row + r + dRow;
-      const nc = piece.col + c + dCol;
-      if (nc < 0 || nc >= COLS || nr >= TOTAL_ROWS) return true;
-      if (nr >= 0 && board[nr][nc]) return true;
-    }
-  }
-  return false;
-}
-
-function rotateMatrix(m: number[][]): number[][] {
-  const n = m.length;
-  const out: number[][] = [];
-  for (let r = 0; r < n; r++) {
-    out.push(new Array(n).fill(0));
-    for (let c = 0; c < n; c++) out[r][c] = m[n - 1 - c][r];
-  }
-  return out;
-}
-
-function tryRotate(board: (string | null)[][], piece: Piece): boolean {
-  const rotated = rotateMatrix(piece.matrix);
-  for (let i = 0; i < KICKS.length; i++) {
-    const dc = KICKS[i][0], dr = KICKS[i][1];
-    if (!collides(board, piece, dr, dc, rotated)) {
-      piece.matrix = rotated;
-      piece.row += dr;
-      piece.col += dc;
-      return true;
-    }
-  }
-  return false;
-}
-
-function getGhost(board: (string | null)[][], piece: Piece): Piece {
-  const g: Piece = { ...piece, matrix: piece.matrix.map(r => r.slice()) };
-  while (!collides(board, g, 1, 0)) g.row++;
-  return g;
-}
-
-function lockPiece(board: (string | null)[][], piece: Piece): (string | null)[][] {
-  const newBoard = board.map(r => r.slice());
-  for (let r = 0; r < piece.matrix.length; r++) {
-    for (let c = 0; c < piece.matrix[r].length; c++) {
-      if (piece.matrix[r][c]) {
-        const br = piece.row + r, bc = piece.col + c;
-        if (br >= 0 && br < TOTAL_ROWS) newBoard[br][bc] = piece.type;
-      }
-    }
-  }
-  return newBoard;
-}
-
-function clearLines(board: (string | null)[][]): { board: (string | null)[][]; cleared: number } {
-  const newBoard = board.map(r => r.slice());
-  let cleared = 0;
-  for (let r = TOTAL_ROWS - 1; r >= 0; r--) {
-    if (newBoard[r].every(v => v !== null)) {
-      newBoard.splice(r, 1);
-      newBoard.unshift(new Array(COLS).fill(null));
-      cleared++;
-      r++;
-    }
-  }
-  return { board: newBoard, cleared };
-}
-
-// ==================== RENDERING ====================
-function drawCell(c: CanvasRenderingContext2D, x: number, y: number, size: number, type: string, isGhost: boolean) {
-  const hue = COLORS[type][0], sat = COLORS[type][1];
-  if (isGhost) {
-    c.strokeStyle = `hsl(${hue} ${sat}% 55% / 0.55)`;
-    c.lineWidth = 2;
-    c.strokeRect(x + 2, y + 2, size - 4, size - 4);
-    return;
-  }
-  const grad = c.createLinearGradient(x, y, x, y + size);
-  grad.addColorStop(0, `hsl(${hue} ${sat}% 62%)`);
-  grad.addColorStop(1, `hsl(${hue} ${sat}% 42%)`);
-  c.fillStyle = grad;
-  c.fillRect(x + 1, y + 1, size - 2, size - 2);
-  c.fillStyle = `hsl(${hue} ${sat}% 80% / 0.35)`;
-  c.fillRect(x + 1, y + 1, size - 2, 3);
-  c.fillRect(x + 1, y + 1, 3, size - 2);
-  c.fillStyle = `hsl(${hue} ${sat}% 25% / 0.4)`;
-  c.fillRect(x + 1, y + size - 4, size - 2, 3);
-  c.fillRect(x + size - 4, y + 1, 3, size - 2);
-}
-
-function render(ctx: CanvasRenderingContext2D, board: (string | null)[][], current: Piece | null, running: boolean, paused: boolean) {
-  ctx.fillStyle = '#0a0e1f';
-  ctx.fillRect(0, 0, W, H);
-
-  ctx.strokeStyle = 'rgba(99,102,241,0.08)';
-  ctx.lineWidth = 1;
-  for (let c = 0; c <= COLS; c++) {
-    ctx.beginPath(); ctx.moveTo(c * CELL, 0); ctx.lineTo(c * CELL, H); ctx.stroke();
-  }
-  for (let r = 0; r <= ROWS; r++) {
-    ctx.beginPath(); ctx.moveTo(0, r * CELL); ctx.lineTo(W, r * CELL); ctx.stroke();
-  }
-
-  for (let r = BUFFER; r < TOTAL_ROWS; r++) {
-    for (let c = 0; c < COLS; c++) {
-      if (board[r][c]) drawCell(ctx, c * CELL, (r - BUFFER) * CELL, CELL, board[r][c], false);
-    }
-  }
-
-  if (running && !paused && current) {
-    const g = getGhost(board, current);
-    for (let r = 0; r < g.matrix.length; r++) {
-      for (let c = 0; c < g.matrix[r].length; c++) {
-        if (g.matrix[r][c]) {
-          const rr = g.row + r - BUFFER, cc = g.col + c;
-          if (rr >= 0) drawCell(ctx, cc * CELL, rr * CELL, CELL, g.type, true);
-        }
-      }
-    }
-    for (let r = 0; r < current.matrix.length; r++) {
-      for (let c = 0; c < current.matrix[r].length; c++) {
-        if (current.matrix[r][c]) {
-          const rr = current.row + r - BUFFER, cc = current.col + c;
-          if (rr >= 0) drawCell(ctx, cc * CELL, rr * CELL, CELL, current.type, false);
-        }
-      }
-    }
-  }
-}
-
-function drawNext(nctx: CanvasRenderingContext2D, nextPiece: string | null) {
-  nctx.fillStyle = 'rgba(15,23,42,0.4)';
-  nctx.fillRect(0, 0, NEXT_W, NEXT_H);
-  if (!nextPiece) return;
-  const m = SHAPES[nextPiece];
-  let minR = 4, maxR = -1, minC = 4, maxC = -1;
-  for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) {
-    if (m[r][c]) {
-      if (r < minR) minR = r; if (r > maxR) maxR = r;
-      if (c < minC) minC = c; if (c > maxC) maxC = c;
-    }
-  }
-  const pw = (maxC - minC + 1) * NEXT_CELL;
-  const ph = (maxR - minR + 1) * NEXT_CELL;
-  const ox = (NEXT_W - pw) / 2 - minC * NEXT_CELL;
-  const oy = (NEXT_H - ph) / 2 - minR * NEXT_CELL;
-  for (let r = 0; r < 4; r++) {
-    for (let c = 0; c < 4; c++) {
-      if (m[r][c]) drawCell(nctx, ox + c * NEXT_CELL, oy + r * NEXT_CELL, NEXT_CELL, nextPiece, false);
-    }
-  }
-}
-
-// ==================== COMPONENT ====================
 export default function App() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const nextCanvasRef = useRef<HTMLCanvasElement>(null);
-  const [score, setScore] = useState(0);
-  const [level, setLevel] = useState(1);
-  const [lines, setLines] = useState(0);
-  const [overlay, setOverlay] = useState({ title: 'TF-047', text: 'Premi Start per giocare', btn: 'Start', show: true });
-
-  const boardRef = useRef<(string | null)[][]>(emptyBoard());
-  const currentRef = useRef<Piece | null>(null);
-  const nextRef = useRef<string | null>(null);
-  const bagRef = useRef<string[]>([]);
-  const scoreRef = useRef(0);
-  const levelRef = useRef(1);
-  const linesRef = useRef(0);
-  const dropMsRef = useRef(BASE_SPEED);
-  const dropAccRef = useRef(0);
-  const runningRef = useRef(false);
-  const pausedRef = useRef(false);
-  const gameOverRef = useRef(false);
-  const lastTimeRef = useRef(0);
-  const keysDownRef = useRef<Set<string>>(new Set());
-
-  const takeFromBag = useCallback(() => {
-    if (bagRef.current.length === 0) bagRef.current = refillBag();
-    return bagRef.current.pop()!;
-  }, []);
-
-  const spawn = useCallback(() => {
-    if (!nextRef.current) nextRef.current = takeFromBag();
-    currentRef.current = makePiece(nextRef.current);
-    nextRef.current = takeFromBag();
-    if (collides(boardRef.current, currentRef.current, 0, 0)) {
-      gameOverRef.current = true;
-      runningRef.current = false;
-      playSound('gameover');
-      setOverlay({ title: 'Game Over', text: `Punteggio finale: ${scoreRef.current}`, btn: 'Riprova', show: true });
-    }
-  }, [takeFromBag]);
-
-  const startGame = useCallback(() => {
-    boardRef.current = emptyBoard();
-    bagRef.current = refillBag();
-    nextRef.current = takeFromBag();
-    scoreRef.current = 0; setScore(0);
-    levelRef.current = 1; setLevel(1);
-    linesRef.current = 0; setLines(0);
-    dropMsRef.current = BASE_SPEED;
-    dropAccRef.current = 0;
-    gameOverRef.current = false;
-    pausedRef.current = false;
-    runningRef.current = true;
-    setOverlay(o => ({ ...o, show: false }));
-    spawn();
-  }, [takeFromBag, spawn]);
-
-  const lockAndSpawn = useCallback(() => {
-    if (!currentRef.current) return;
-    boardRef.current = lockPiece(boardRef.current, currentRef.current);
-    const { board: newBoard, cleared } = clearLines(boardRef.current);
-    boardRef.current = newBoard;
-    if (cleared > 0) {
-      playSound('clear');
-      linesRef.current += cleared;
-      scoreRef.current += LINE_SCORE[cleared] * levelRef.current;
-      setScore(scoreRef.current);
-      setLines(linesRef.current);
-      const newLevel = Math.floor(linesRef.current / LINES_PER_LEVEL) + 1;
-      if (newLevel !== levelRef.current) {
-        playSound('levelup');
-        levelRef.current = newLevel;
-        setLevel(newLevel);
-        dropMsRef.current = Math.max(MIN_SPEED, BASE_SPEED - (newLevel - 1) * SPEED_STEP);
-      }
-    } else {
-      playSound('lock');
-    }
-    spawn();
-  }, [spawn]);
-
-  const hardDrop = useCallback(() => {
-    if (!runningRef.current || pausedRef.current || !currentRef.current) return;
-    let dist = 0;
-    while (!collides(boardRef.current, currentRef.current, 1, 0)) {
-      currentRef.current.row++;
-      dist++;
-    }
-    scoreRef.current += dist * 2;
-    setScore(scoreRef.current);
-    playSound('drop');
-    lockAndSpawn();
-  }, [lockAndSpawn]);
-
-  const softDrop = useCallback(() => {
-    if (!runningRef.current || pausedRef.current || !currentRef.current) return;
-    if (!collides(boardRef.current, currentRef.current, 1, 0)) {
-      currentRef.current.row++;
-      dropAccRef.current = 0;
-    } else {
-      lockAndSpawn();
-    }
-  }, [lockAndSpawn]);
-
-  const moveLeft = useCallback(() => {
-    if (!runningRef.current || pausedRef.current || !currentRef.current) return;
-    if (!collides(boardRef.current, currentRef.current, 0, -1)) {
-      currentRef.current.col--;
-      playSound('move');
-    }
-  }, []);
-
-  const moveRight = useCallback(() => {
-    if (!runningRef.current || pausedRef.current || !currentRef.current) return;
-    if (!collides(boardRef.current, currentRef.current, 0, 1)) {
-      currentRef.current.col++;
-      playSound('move');
-    }
-  }, []);
-
-  const doRotate = useCallback(() => {
-    if (!runningRef.current || pausedRef.current || !currentRef.current) return;
-    if (tryRotate(boardRef.current, currentRef.current)) {
-      playSound('rotate');
-    }
-  }, []);
-
-  const togglePause = useCallback(() => {
-    if (!runningRef.current || gameOverRef.current) return;
-    pausedRef.current = !pausedRef.current;
-    if (pausedRef.current) {
-      setOverlay({ title: 'Pausa', text: 'Premi P per riprendere', btn: 'Riprendi', show: true });
-    } else {
-      setOverlay(o => ({ ...o, show: false }));
-    }
-  }, []);
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const k = e.key;
-      keysDownRef.current.add(k);
-      if (k === 'p' || k === 'P') { togglePause(); e.preventDefault(); return; }
-      if (!runningRef.current || pausedRef.current) return;
-      switch (k) {
-        case 'ArrowLeft': moveLeft(); e.preventDefault(); break;
-        case 'ArrowRight': moveRight(); e.preventDefault(); break;
-        case 'ArrowDown': softDrop(); e.preventDefault(); break;
-        case 'ArrowUp':
-        case 'x': case 'X': doRotate(); e.preventDefault(); break;
-        case ' ': hardDrop(); e.preventDefault(); break;
-      }
-    };
-    const handleKeyUp = (e: KeyboardEvent) => {
-      keysDownRef.current.delete(e.key);
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-    };
-  }, [togglePause, moveLeft, moveRight, softDrop, doRotate, hardDrop]);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const nextCanvas = nextCanvasRef.current;
-    if (!canvas || !nextCanvas) return;
-    const ctx = canvas.getContext('2d')!;
-    const nctx = nextCanvas.getContext('2d')!;
-    canvas.width = W; canvas.height = H;
-    nextCanvas.width = NEXT_W; nextCanvas.height = NEXT_H;
-
-    let rafId: number;
-    const loop = (t: number) => {
-      const dt = t - lastTimeRef.current;
-      lastTimeRef.current = t;
-      if (runningRef.current && !pausedRef.current && !gameOverRef.current) {
-        dropAccRef.current += dt;
-        const interval = keysDownRef.current.has('ArrowDown') ? dropMsRef.current * SOFT_DROP_FACTOR : dropMsRef.current;
-        while (dropAccRef.current >= interval) {
-          dropAccRef.current -= interval;
-          if (!currentRef.current || !collides(boardRef.current, currentRef.current, 1, 0)) {
-            if (currentRef.current) currentRef.current.row++;
-          } else {
-            lockAndSpawn();
-            break;
-          }
-        }
-      }
-      render(ctx, boardRef.current, currentRef.current, runningRef.current, pausedRef.current);
-      drawNext(nctx, nextRef.current);
-      rafId = requestAnimationFrame(loop);
-    };
-    rafId = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(rafId);
-  }, [lockAndSpawn]);
+  const game = useTetris();
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col items-center justify-center p-4 font-sans">
-      <div className="flex gap-6 items-stretch">
-        <div className="relative rounded-2xl overflow-hidden shadow-2xl ring-1 ring-indigo-500/30">
-          <canvas ref={canvasRef} className="block bg-slate-900" />
-          {overlay.show && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/90 backdrop-blur-sm gap-4 z-10">
-              <h2 className="text-3xl font-extrabold tracking-wide">{overlay.title}</h2>
-              <p className="text-slate-400 text-sm">{overlay.text}</p>
-              <button
-                onClick={() => {
-                  if (pausedRef.current && !gameOverRef.current) {
-                    pausedRef.current = false;
-                    setOverlay(o => ({ ...o, show: false }));
-                  } else {
-                    startGame();
-                  }
-                }}
-                className="mt-2 px-7 py-3 bg-gradient-to-br from-indigo-500 to-violet-500 text-white rounded-xl font-semibold shadow-lg hover:scale-105 transition-transform"
-              >
-                {overlay.btn}
-              </button>
-            </div>
-          )}
-        </div>
-        <div className="flex flex-col gap-4 w-56">
-          <div className="bg-slate-800/50 border border-indigo-500/20 rounded-2xl p-4 backdrop-blur">
-            <h3 className="text-xs font-bold uppercase tracking-widest text-indigo-400 mb-3">Prossimo</h3>
-            <canvas ref={nextCanvasRef} className="block mx-auto" />
+    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-teal-950 text-slate-100">
+      {/* Live region for screen readers */}
+      <div
+        aria-live="assertive"
+        aria-atomic="true"
+        className="sr-only"
+        role="status"
+      >
+        {game.announce}
+      </div>
+
+      <div className="mx-auto max-w-6xl px-4 py-6 sm:py-10">
+        {/* Header */}
+        <header className="mb-6 flex flex-col gap-4 sm:mb-10 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.25em] text-teal-400">
+              Arcade · Accessible
+            </p>
+            <h1 className="mt-1 font-serif text-4xl font-bold tracking-tight text-white sm:text-5xl">
+              Tetris<span className="text-teal-400">.</span>
+            </h1>
+            <p className="mt-2 max-w-md text-sm text-slate-400">
+              Real-time speed curve, wall-kick rotations, keyboard & touch controls.
+              Built for keyboard and screen-reader users alike.
+            </p>
           </div>
-          <div className="bg-slate-800/50 border border-indigo-500/20 rounded-2xl p-4 backdrop-blur">
-            <h3 className="text-xs font-bold uppercase tracking-widest text-indigo-400 mb-3">Punteggio</h3>
-            <div className="grid gap-3">
-              <div className="flex justify-between items-baseline">
-                <span className="text-xs uppercase tracking-wider text-slate-500">Punti</span>
-                <span className="text-2xl font-extrabold text-slate-100 tabular-nums">{score}</span>
-              </div>
-              <div className="flex justify-between items-baseline">
-                <span className="text-xs uppercase tracking-wider text-slate-500">Livello</span>
-                <span className="text-2xl font-extrabold text-slate-100 tabular-nums">{level}</span>
-              </div>
-              <div className="flex justify-between items-baseline">
-                <span className="text-xs uppercase tracking-wider text-slate-500">Linee</span>
-                <span className="text-2xl font-extrabold text-slate-100 tabular-nums">{lines}</span>
-              </div>
-            </div>
+
+          <div className="flex items-center gap-3">
+            <Button
+              size="lg"
+              onClick={game.startOrRestart}
+              className="bg-teal-500 text-slate-950 hover:bg-teal-400 focus-visible:ring-4 focus-visible:ring-teal-400/40"
+              aria-label={game.status === "gameover" ? "Ricomincia partita" : "Inizia partita"}
+            >
+              <Play className="h-5 w-5" />
+              {game.status === "idle" ? "Inizia" : game.status === "gameover" ? "Ricomincia" : "Nuova"}
+            </Button>
+            <Button
+              size="lg"
+              variant="outline"
+              onClick={game.togglePause}
+              disabled={game.status === "idle" || game.status === "gameover"}
+              className="border-slate-600 bg-slate-800/60 text-white hover:bg-slate-700 focus-visible:ring-4 focus-visible:ring-teal-400/40"
+              aria-label={game.status === "paused" ? "Riprendi partita" : "Metti in pausa la partita"}
+            >
+              <Pause className="h-5 w-5" />
+              {game.status === "paused" ? "Riprendi" : "Pausa"}
+            </Button>
           </div>
-          <div className="bg-slate-800/50 border border-indigo-500/20 rounded-2xl p-4 backdrop-blur">
-            <h3 className="text-xs font-bold uppercase tracking-widest text-indigo-400 mb-3">Controlli</h3>
-            <div className="text-xs leading-relaxed text-slate-400 space-y-1">
-              <div className="flex justify-between"><span>Sinistra</span><kbd className="bg-indigo-500/10 border border-indigo-500/30 rounded px-2 py-0.5 text-indigo-300 font-mono">←</kbd></div>
-              <div className="flex justify-between"><span>Destra</span><kbd className="bg-indigo-500/10 border border-indigo-500/30 rounded px-2 py-0.5 text-indigo-300 font-mono">→</kbd></div>
-              <div className="flex justify-between"><span>Soft drop</span><kbd className="bg-indigo-500/10 border border-indigo-500/30 rounded px-2 py-0.5 text-indigo-300 font-mono">↓</kbd></div>
-              <div className="flex justify-between"><span>Ruota</span><kbd className="bg-indigo-500/10 border border-indigo-500/30 rounded px-2 py-0.5 text-indigo-300 font-mono">X / ↑</kbd></div>
-              <div className="flex justify-between"><span>Hard drop</span><kbd className="bg-indigo-500/10 border border-indigo-500/30 rounded px-2 py-0.5 text-indigo-300 font-mono">Space</kbd></div>
-              <div className="flex justify-between"><span>Pausa</span><kbd className="bg-indigo-500/10 border border-indigo-500/30 rounded px-2 py-0.5 text-indigo-300 font-mono">P</kbd></div>
+        </header>
+
+        {/* Main layout */}
+        <div className="grid gap-6 lg:grid-cols-[auto_1fr] lg:gap-8">
+          {/* Board column */}
+          <div className="flex flex-col items-center gap-4">
+            <div className="relative rounded-2xl border border-slate-700/60 bg-slate-900/60 p-3 shadow-2xl shadow-teal-950/40 ring-1 ring-teal-500/10">
+              <TetrisCanvas
+                board={game.board}
+                piece={game.piece}
+                ghost={game.ghost}
+                status={game.status}
+              />
+              {game.status === "paused" && (
+                <div className="absolute inset-3 flex flex-col items-center justify-center rounded-xl bg-slate-950/80 backdrop-blur-sm">
+                  <Pause className="h-10 w-10 text-teal-400" />
+                  <p className="mt-2 font-serif text-2xl font-bold text-white">In pausa</p>
+                  <p className="text-sm text-slate-400">Premi P o Riprendi</p>
+                </div>
+              )}
+              {game.status === "gameover" && (
+                <div className="absolute inset-3 flex flex-col items-center justify-center rounded-xl bg-slate-950/85 backdrop-blur-sm">
+                  <p className="font-serif text-3xl font-bold text-rose-400">Game Over</p>
+                  <p className="mt-1 text-sm text-slate-300">Punteggio: {game.score}</p>
+                  <Button
+                    className="mt-4 bg-teal-500 text-slate-950 hover:bg-teal-400"
+                    onClick={game.startOrRestart}
+                    aria-label="Ricomincia partita"
+                  >
+                    <RotateCw className="h-4 w-4" /> Ricomincia
+                  </Button>
+                </div>
+              )}
             </div>
+
+            {/* Touch controls */}
+            <TouchControls
+              onLeft={game.moveLeft}
+              onRight={game.moveRight}
+              onRotate={game.rotate}
+              onSoftDropStart={game.startSoftDrop}
+              onSoftDropEnd={game.endSoftDrop}
+              onHardDrop={game.hardDrop}
+              onTogglePause={game.togglePause}
+              status={game.status}
+            />
+          </div>
+
+          {/* Side panel */}
+          <div className="flex flex-col gap-4">
+            <div className="grid grid-cols-3 gap-3 lg:grid-cols-1">
+              <StatCard label="Punteggio" value={game.score} accent="teal" />
+              <StatCard label="Righe" value={game.lines} accent="emerald" />
+              <StatCard label="Livello" value={game.level} accent="cyan" />
+            </div>
+
+            <Card className="border-slate-700/60 bg-slate-800/40 shadow-lg">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-semibold uppercase tracking-wider text-teal-300">
+                  Stato
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="flex items-center gap-2">
+                  <span
+                    className={
+                      "inline-block h-2.5 w-2.5 rounded-full " +
+                      (game.status === "playing"
+                        ? "bg-teal-400 animate-pulse"
+                        : game.status === "paused"
+                        ? "bg-amber-400"
+                        : game.status === "gameover"
+                        ? "bg-rose-500"
+                        : "bg-slate-500")
+                    }
+                  />
+                  <span className="text-lg font-medium text-white">
+                    {statusLabel(game.status)}
+                  </span>
+                </div>
+                <p className="mt-3 text-xs text-slate-400">
+                  Velocità: {(game.fallIntervalMs).toFixed(0)}ms / caduta
+                </p>
+              </CardContent>
+            </Card>
+
+            <Card className="border-slate-700/60 bg-slate-800/40 shadow-lg">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-semibold uppercase tracking-wider text-teal-300">
+                  Controlli
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="text-sm text-slate-300">
+                <ul className="space-y-1.5">
+                  <li><Kbd>←</Kbd> <Kbd>→</Kbd> — Muovi</li>
+                  <li><Kbd>↑</Kbd> / <Kbd>T</Kbd> — Ruota</li>
+                  <li><Kbd>↓</Kbd> — Soft drop (tenibile)</li>
+                  <li><Kbd>Space</Kbd> — Hard drop</li>
+                  <li><Kbd>P</Kbd> — Pausa / Riprendi</li>
+                </ul>
+              </CardContent>
+            </Card>
           </div>
         </div>
       </div>
     </div>
+  );
+}
+
+function statusLabel(s: string) {
+  switch (s) {
+    case "idle": return "Pronto";
+    case "playing": return "In gioco";
+    case "paused": return "In pausa";
+    case "gameover": return "Game Over";
+    default: return s;
+  }
+}
+
+function Kbd({ children }: { children: React.ReactNode }) {
+  return (
+    <kbd className="inline-flex min-w-7 items-center justify-center rounded-md border border-slate-600 bg-slate-900 px-1.5 py-0.5 text-xs font-semibold text-teal-300">
+      {children}
+    </kbd>
+  );
+}
+
+function StatCard({
+  label,
+  value,
+  accent,
+}: {
+  label: string;
+  value: number;
+  accent: "teal" | "emerald" | "cyan";
+}) {
+  const ring =
+    accent === "teal"
+      ? "ring-teal-500/20 bg-teal-500/10"
+      : accent === "emerald"
+      ? "ring-emerald-500/20 bg-emerald-500/10"
+      : "ring-cyan-500/20 bg-cyan-500/10";
+  return (
+    <Card className={"border-slate-700/60 bg-slate-800/40 shadow-lg ring-1 " + ring}>
+      <CardContent className="px-4 py-4">
+        <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+          {label}
+        </p>
+        <p className="mt-1 font-serif text-3xl font-bold text-white tabular-nums">
+          {value}
+        </p>
+      </CardContent>
+    </Card>
   );
 }
